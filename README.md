@@ -18,7 +18,12 @@ luvit-ai/
 │   └── main.py               ← FastAPI server (connect to Luvit app)
 └── README.md
 ```
+## 🔑 Environment Variables
 
+Create a `.env` file inside the `backend/` folder:
+```
+ANTHROPIC_API_KEY=your-api-key-here
+```
 ---
 
 ## 🗺️ 8-Week Roadmap
