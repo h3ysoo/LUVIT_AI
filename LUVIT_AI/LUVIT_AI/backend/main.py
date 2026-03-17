@@ -48,16 +48,19 @@ def init_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            id            TEXT PRIMARY KEY,
-            name          TEXT,
-            goals         TEXT,
-            fitness_level TEXT,
-            equipment     TEXT,
-            weekly_days   INTEGER,
-            injuries      TEXT,
-            active_coach  TEXT DEFAULT 'lucia',
-            created_at    TEXT,
-            updated_at    TEXT
+            id               TEXT PRIMARY KEY,
+            name             TEXT,
+            goals            TEXT,
+            fitness_level    TEXT,
+            equipment        TEXT,
+            weekly_days      INTEGER,
+            injuries         TEXT,
+            active_coach     TEXT DEFAULT 'lucia',
+            workout_location TEXT,
+            last_checkin     TEXT,
+            workout_count    INTEGER DEFAULT 0,
+            created_at       TEXT,
+            updated_at       TEXT
         );
         CREATE TABLE IF NOT EXISTS conversations (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +78,28 @@ def init_db():
             reason      TEXT,
             switched_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS onboarding_sessions (
+            user_id          TEXT PRIMARY KEY,
+            step             INTEGER DEFAULT 0,
+            workout_location TEXT,
+            fitness_goal     TEXT,
+            weekly_days      TEXT,
+            experience_level TEXT,
+            injuries         TEXT,
+            created_at       TEXT,
+            updated_at       TEXT
+        );
     """)
+    # Migrate existing DB: add new columns if they don't exist
+    for col, definition in [
+        ("workout_location", "TEXT"),
+        ("last_checkin", "TEXT"),
+        ("workout_count", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+        except Exception:
+            pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -181,6 +205,7 @@ User profile:
 - Name: {user_profile.get('name')}
 - Goal: {user_profile.get('goals')}
 - Fitness level: {user_profile.get('fitness_level')}
+- Workout location: {user_profile.get('workout_location') or 'home'}
 - Equipment: {user_profile.get('equipment')}
 - Available days/week: {user_profile.get('weekly_days')}
 - Injuries/limitations: {user_profile.get('injuries') or 'none'}
@@ -218,6 +243,14 @@ class CoachSwitchRequest(BaseModel):
     user_id: str
     new_coach: str
     reason: Optional[str] = None
+
+class StartConversationRequest(BaseModel):
+    user_id: str
+    answer: Optional[str] = None  # None = start fresh
+
+class WeeklyCheckinRequest(BaseModel):
+    user_id: str
+    message: str  # User's answer to "Geçen hafta nasıl gitti?"
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -408,8 +441,241 @@ def clear_history(user_id: str, coach: Optional[str] = None):
     finally:
         conn.close()
 
+# ── Onboarding Questions ──────────────────────────────────────────────────────
+ONBOARDING_QUESTIONS = [
+    {
+        "step": 1,
+        "field": "workout_location",
+        "question": "Nerede antrenman yapıyorsun? 🏠\n(ev / gym / dışarısı)",
+    },
+    {
+        "step": 2,
+        "field": "fitness_goal",
+        "question": "Fitness hedefin ne? 🎯\n(kilo vermek / kas yapmak / sağlıklı kalmak / atletizm)",
+    },
+    {
+        "step": 3,
+        "field": "weekly_days",
+        "question": "Haftada kaç gün antrenman yapabilirsin? 📅",
+    },
+    {
+        "step": 4,
+        "field": "experience_level",
+        "question": "Deneyim seviyeni nasıl tanımlarsın? 💡\n(yeni başlayan / orta seviye / ileri seviye)",
+    },
+    {
+        "step": 5,
+        "field": "injuries",
+        "question": "Herhangi bir sakatlığın ya da fiziksel sınırlılığın var mı? 🩺\n(varsa belirt, yoksa 'yok' yaz)",
+    },
+]
+
+COACH_RECOMMENDATION_PROMPT = """Based on the user's onboarding answers, recommend the best coach from: lucia, arne, or maya.
+
+User answers:
+- Workout location: {workout_location}
+- Fitness goal: {fitness_goal}
+- Weekly training days: {weekly_days}
+- Experience level: {experience_level}
+- Injuries/limitations: {injuries}
+
+Coach profiles:
+- lucia: High-energy, tough love, best for weight loss, athletic goals, motivated intermediate/advanced users
+- arne: Calm, science-based, best for muscle building, users who want to understand the 'why', sustainable long-term approach
+- maya: Cheerful, beginner-friendly, best for complete beginners, confidence building, gentle start
+
+Respond in Turkish with:
+1. Which coach you recommend (just the id: lucia/arne/maya)
+2. A warm, personalized 2-3 sentence explanation of WHY this coach fits them
+3. A brief intro from that coach welcoming them
+
+Format your response as JSON:
+{{"recommended_coach": "...", "reason": "...", "coach_intro": "..."}}"""
+
+
+@app.post("/start-conversation")
+def start_conversation(req: StartConversationRequest):
+    """
+    Sequential onboarding: ask questions one by one, then recommend a coach.
+    - First call (answer=None): resets session, returns question 1
+    - Subsequent calls (with answer): saves answer, returns next question
+    - After all 5 answers: recommends best coach
+    """
+    conn = get_db()
+    try:
+        now = datetime.utcnow().isoformat()
+
+        # Start fresh
+        if req.answer is None:
+            conn.execute("""
+                INSERT OR REPLACE INTO onboarding_sessions
+                (user_id, step, workout_location, fitness_goal, weekly_days, experience_level, injuries, created_at, updated_at)
+                VALUES (?, 0, NULL, NULL, NULL, NULL, NULL, ?, ?)
+            """, (req.user_id, now, now))
+            conn.commit()
+
+            return {
+                "step": 1,
+                "total_steps": 5,
+                "question": ONBOARDING_QUESTIONS[0]["question"],
+                "done": False,
+            }
+
+        # Load current session
+        row = conn.execute(
+            "SELECT * FROM onboarding_sessions WHERE user_id=?", (req.user_id,)
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(400, "No active session. Call /start-conversation with answer=null first.")
+
+        session = dict(row)
+        current_step = session["step"]
+
+        if current_step >= 5:
+            raise HTTPException(400, "Onboarding already completed.")
+
+        # Save the answer for the current step
+        field = ONBOARDING_QUESTIONS[current_step]["field"]
+        next_step = current_step + 1
+
+        conn.execute(
+            f"UPDATE onboarding_sessions SET {field}=?, step=?, updated_at=? WHERE user_id=?",
+            (req.answer, next_step, now, req.user_id)
+        )
+        conn.commit()
+
+        # If more questions remain, return next one
+        if next_step < 5:
+            return {
+                "step": next_step + 1,
+                "total_steps": 5,
+                "question": ONBOARDING_QUESTIONS[next_step]["question"],
+                "done": False,
+            }
+
+        # All 5 answers collected — ask Claude to recommend a coach
+        updated = dict(conn.execute(
+            "SELECT * FROM onboarding_sessions WHERE user_id=?", (req.user_id,)
+        ).fetchone())
+
+        prompt = COACH_RECOMMENDATION_PROMPT.format(
+            workout_location=updated["workout_location"],
+            fitness_goal=updated["fitness_goal"],
+            weekly_days=updated["weekly_days"],
+            experience_level=updated["experience_level"],
+            injuries=updated["injuries"],
+        )
+
+        raw = call_claude(
+            system="You are a helpful assistant that recommends fitness coaches. Always respond with valid JSON.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        import json as _json
+        try:
+            result = _json.loads(raw)
+        except Exception:
+            # Fallback: extract JSON from response
+            import re
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            result = _json.loads(match.group()) if match else {
+                "recommended_coach": "maya",
+                "reason": "Sana en uygun koçu önermek için bilgilerini değerlendirdim.",
+                "coach_intro": "Merhaba! Seninle çalışmaya hazırım!",
+            }
+
+        recommended = result.get("recommended_coach", "maya")
+        if recommended not in PERSONAS:
+            recommended = "maya"
+
+        # Clean up session
+        conn.execute("DELETE FROM onboarding_sessions WHERE user_id=?", (req.user_id,))
+        conn.commit()
+
+        return {
+            "step": 5,
+            "total_steps": 5,
+            "done": True,
+            "recommended_coach": recommended,
+            "coach_name": PERSONAS[recommended]["name"],
+            "coach_emoji": PERSONAS[recommended]["emoji"],
+            "reason": result.get("reason", ""),
+            "coach_intro": result.get("coach_intro", ""),
+            "collected_data": {
+                "workout_location": updated["workout_location"],
+                "fitness_goal": updated["fitness_goal"],
+                "weekly_days": updated["weekly_days"],
+                "experience_level": updated["experience_level"],
+                "injuries": updated["injuries"],
+            },
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/weekly-checkin")
+def weekly_checkin(req: WeeklyCheckinRequest):
+    """
+    Haftalık check-in: koç 'Geçen hafta nasıl gitti?' diye sorar,
+    kullanıcı cevaplar, koç programı günceller ve motive eder.
+    """
+    conn = get_db()
+    try:
+        user = get_user(conn, req.user_id)
+        if not user:
+            raise HTTPException(404, "User not found. Complete onboarding first.")
+
+        coach = user["active_coach"]
+        now = datetime.utcnow().isoformat()
+
+        # Build check-in context for the coach
+        checkin_system = build_system_prompt(coach, user) + """
+
+This is a WEEKLY CHECK-IN conversation. The user is reporting on their last week.
+Your job:
+1. Acknowledge their effort warmly (even if they missed sessions)
+2. Evaluate what they reported — celebrate wins, address struggles without judgment
+3. Suggest 1-2 specific adjustments for the coming week based on their feedback
+4. End with an encouraging message for the week ahead
+Keep it under 150 words."""
+
+        history = get_conversation_history(conn, req.user_id, coach, limit=6)
+        checkin_prompt = f"Haftalık check-in: {req.message}"
+        messages = history + [{"role": "user", "content": checkin_prompt}]
+
+        response = call_claude(checkin_system, messages)
+
+        # Update last_checkin and increment workout_count if they mentioned doing workouts
+        workout_keywords = ["yaptım", "antrenman", "egzersiz", "koştum", "çalıştım", "tamamladım"]
+        mentioned_workout = any(kw in req.message.lower() for kw in workout_keywords)
+        current_count = user.get("workout_count") or 0
+
+        conn.execute(
+            "UPDATE users SET last_checkin=?, workout_count=?, updated_at=? WHERE id=?",
+            (now[:10], current_count + (1 if mentioned_workout else 0), now, req.user_id)
+        )
+
+        save_message(conn, req.user_id, coach, "user", checkin_prompt)
+        save_message(conn, req.user_id, coach, "assistant", response)
+        conn.commit()
+
+        updated_user = get_user(conn, req.user_id)
+
+        return {
+            "coach": coach,
+            "coach_name": PERSONAS[coach]["name"],
+            "response": response,
+            "last_checkin": updated_user.get("last_checkin"),
+            "workout_count": updated_user.get("workout_count", 0),
+            "timestamp": now,
+        }
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     import uvicorn
-    print("🏋️  Luvit AI Coach API v3.0 — Powered by Claude")
-    print("📖  Docs: http://localhost:8000/docs")
+    print("Luvit AI Coach API v3.0 - Powered by Claude")
+    print("Docs: http://localhost:8000/docs")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
