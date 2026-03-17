@@ -17,6 +17,7 @@ import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -262,6 +263,11 @@ def root():
         "powered_by": "Claude AI (Anthropic)",
         "coaches": list(PERSONAS.keys()),
     }
+
+@app.get("/demo")
+def demo():
+    html_path = Path(__file__).parent / "demo.html"
+    return FileResponse(str(html_path), media_type="text/html")
 
 @app.get("/coaches")
 def list_coaches():
